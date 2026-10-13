@@ -1251,11 +1251,23 @@ def check_caller_service(repo_root) -> ComplianceResult:
     )
     for jf in _iter_java(repo_root):
         content = _read(jf)
-        # 1) Caller-Service seteado manualmente (prohibido).
-        if "Caller-Service" in content:
+        # 1) Caller-Service RE-PROPAGADO desde el AppContext entrante (prohibido, Req 57).
+        #    webflux-web-client ya propaga automáticamente el Caller-Service del contexto;
+        #    re-ponerlo a mano desde context.callerService()/AppContext.CALLER_SERVICE es la
+        #    violación. En cambio, FIJAR la identidad propia del micro con una constante/literal
+        #    (p. ej. Map.of("Caller-Service", CALLER_SERVICE) donde CALLER_SERVICE="<dominio>-comp-<metodo>")
+        #    es CORRECTO: es cómo el micro se identifica ante los downstream (lineamiento 06).
+        if "Caller-Service" in content or "AppContext.CALLER_SERVICE" in content:
+            # Señales de que el valor proviene del contexto entrante (lo que Req 57 prohíbe).
+            _ctx_caller_re = re.compile(
+                r'(?:\w+\.)?callerService\s*\(\)|getCallerService\s*\(\)|AppContext\.CALLER_SERVICE',
+                re.IGNORECASE)
             for i, line in enumerate(content.splitlines(), 1):
-                if "Caller-Service" in line and (".set(" in line or "Map.of(" in line or ".header(" in line):
-                    iss.append(f"{jf.name}:{i} Caller-Service seteado manual")
+                mentions_header = ("Caller-Service" in line or "AppContext.CALLER_SERVICE" in line)
+                sets_header = mentions_header and (".set(" in line or ".put(" in line
+                                                   or "Map.of(" in line or ".header(" in line)
+                if sets_header and _ctx_caller_re.search(line):
+                    iss.append(f"{jf.name}:{i} Caller-Service re-propagado del contexto (lo propaga la librería, Req 57)")
 
         # 2) Adapters HTTP salientes deben llevar @LogExternalCall (SOLO wrappers).
         is_http_adapter = jf.name.endswith("Adapter.java") and "WebClientComponent" in content
@@ -3442,6 +3454,212 @@ def generate_individual_json_analysis(a: MicroAnalysis, output_dir):
     return fp
 
 
+# ── Markdown individual (reporte legible, mismos datos que el JSON) ─────────────
+
+# Etiquetas legibles por nombre interno de criterio (para el reporte markdown).
+_CRITERIO_LABEL = {
+    "arquetipo": "Arquetipo (estructura SB4)",
+    "main_gradle": "main.gradle (estándar)",
+    "librerias_ficohsa": "Librerías Ficohsa",
+    "jackson3": "Jackson 3",
+    "logging": "Logs (webflux-logging)",
+    "resilience": "Resilience (@FicohsaResilience)",
+    "mappers": "MapStruct Mappers",
+    "envelope": "Request Envelope",
+    "caller_service": "Caller-Service / @LogExternalCall",
+    "regionalizacion": "Regionalización",
+    "homologacion": "Homologación",
+    "dtos": "DTOs (record)",
+    "cobertura": "Cobertura 85%",
+    "configmap": "ConfigMap (k8s)",
+    "credenciales": "Credenciales gradle",
+    "excepciones": "Sin excepciones custom",
+    "sizing": "Tallaje (ms-sizing)",
+    "vg_cm_alineacion": "Variable Group ↔ cm.yaml",
+}
+# Criterios considerados CRÍTICOS (alineado con CRITICAL_CRITERIA del pipeline).
+_CRITICAL_FOR_MD = CRITICAL_CRITERIA
+
+
+def _crit_label(name):
+    return _CRITERIO_LABEL.get(name, name)
+
+
+def _clean_et_source(fuente):
+    """Limpia la fuente de la ET: 'HU #62715 (https://...)' -> 'HU #62715'."""
+    if not fuente:
+        return ""
+    return re.sub(r"\s*\(https?://.*$", "", fuente).strip()
+
+
+def generate_individual_markdown(a: MicroAnalysis, output_dir):
+    """Genera un reporte .md DETALLADO a partir del mismo dict que alimenta el JSON:
+    metadatos, resumen de criterios con criticidad, detalle (positivos + issues) de cada
+    criterio, criterios por método, librerías, hexagonal, AWS, ET y Variable Group."""
+    os.makedirs(output_dir, exist_ok=True)
+    d = _analysis_to_dict(a)
+    L = []
+    icon = {"CUMPLE": "✅", "NO CUMPLE": "❌", "NO ENCONTRADO": "🔎",
+            "PARCIAL": "🟡", "N/A": "➖"}.get
+    st_icon = {"ok": "✅", "fail": "❌", "na": "➖", "warn": "🟡"}.get
+
+    hex_ = d.get("hexagonal", {}) or {}
+    boot = d.get("spring_boot_version", "") or "-"
+    estado_mig = (d.get("migration_state", "") or "").upper() or "-"
+    criterios = d.get("criterios_micro", []) or []
+    n_fail = sum(1 for c in criterios if c.get("estado") == "NO CUMPLE")
+    n_fail_crit = sum(1 for c in criterios
+                      if c.get("estado") == "NO CUMPLE" and c.get("criterio") in _CRITICAL_FOR_MD)
+    n_nf = sum(1 for c in criterios if c.get("estado") == "NO ENCONTRADO")
+    n_ok = sum(1 for c in criterios if c.get("estado") == "CUMPLE")
+    et_fuente = _clean_et_source((d.get("especificacion_tecnica") or {}).get("fuente") or "")
+
+    # ── Encabezado ──
+    L.append(f"# Reporte de Compliance — `{d.get('microservicio','')}`\n")
+    L.append(f"> Generado el {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+             f"pipeline `compliance_pipeline_v5.py` (modo `--single`).\n")
+    L.append("| Campo | Valor |")
+    L.append("|---|---|")
+    L.append(f"| Microservicio | `{d.get('microservicio','')}` |")
+    L.append(f"| Clasificación | {d.get('clasificacion','') or '-'} |")
+    L.append(f"| Estado migración | {estado_mig} — Spring Boot {boot} |")
+    L.append(f"| Rama / Commit | `{d.get('source_branch','') or '-'}` / `{d.get('source_commit','') or '-'}` |")
+    L.append(f"| Repositorio | {d.get('repo_url','') or '-'} |")
+    L.append(f"| LOC | {d.get('lines_of_code','') or '-'} |")
+    hu = d.get("hu_id") or ""
+    hu_title = d.get("hu_title") or ""
+    hu_cell = (f"#{hu}" + (f" — {hu_title}" if hu_title else "")) if hu else (et_fuente or "-")
+    L.append(f"| HU asociada | {hu_cell} |")
+    L.append(f"| Validación hexagonal | {hex_.get('errors',0)} errores / {hex_.get('warnings',0)} warnings |")
+    L.append(f"| **Cumplimiento global** | **{d.get('porcentaje','')} %** |")
+    resultado = "FALLÓ" if n_fail else "PASÓ"
+    extra = f" ({n_fail} NO CUMPLE, {n_fail_crit} crítico(s))" if n_fail else ""
+    L.append(f"| **Resultado** | **{resultado}{extra}** |")
+    L.append("")
+
+    # ── Conteo ──
+    L.append(f"**Criterios:** {n_ok} CUMPLE · {n_fail} NO CUMPLE · {n_nf} NO ENCONTRADO "
+             f"(de {len(criterios)} evaluados).\n")
+
+    # ── Resumen de criterios con criticidad ──
+    L.append("## Resumen de criterios (nivel microservicio)\n")
+    L.append("| # | Criterio | Crítico | Estado | Observación |")
+    L.append("|---|---|:---:|:---:|---|")
+    for i, c in enumerate(criterios, 1):
+        est = c.get("estado", "")
+        crit = "🔴" if c.get("criterio") in _CRITICAL_FOR_MD else ""
+        obs = (c.get("observacion") or "").replace("\n", " ").replace("|", "\\|")
+        if len(obs) > 160:
+            obs = obs[:157] + "…"
+        L.append(f"| {i} | {_crit_label(c.get('criterio',''))} | {crit} | {icon(est,'')} {est} | {obs} |")
+    L.append("")
+
+    # ── Detalle completo de cada criterio ──
+    L.append("## Detalle por criterio\n")
+    for c in criterios:
+        est = c.get("estado", "")
+        crit_tag = " · 🔴 CRÍTICO" if c.get("criterio") in _CRITICAL_FOR_MD else ""
+        L.append(f"### {icon(est,'')} {_crit_label(c.get('criterio',''))} — {est}{crit_tag}")
+        pos = c.get("positivos") or []
+        iss = c.get("issues") or []
+        if pos:
+            L.append("**Cumple:**")
+            for p in pos:
+                L.append(f"- {p}")
+        if iss:
+            L.append("**Hallazgos / acción:**")
+            for x in iss:
+                L.append(f"- {x}")
+        if not pos and not iss:
+            L.append("_(sin observaciones)_")
+        L.append("")
+
+    # ── Criterios por método ──
+    met = d.get("criterios_por_metodo") or {}
+    if met:
+        L.append("## Criterios por método\n")
+        for method, checks in met.items():
+            L.append(f"### `{method}`\n")
+            L.append("| Criterio | Estado | Detalle |")
+            L.append("|---|:---:|---|")
+            for ck in checks:
+                est = ck.get("estado", "")
+                det = " ".join((ck.get("positivos") or []) + (ck.get("issues") or []))
+                det = det.replace("\n", " ").replace("|", "\\|")
+                L.append(f"| {ck.get('criterio','')} | {icon(est,'')} {est} | {det} |")
+            L.append("")
+
+    # ── Librerías Ficohsa ──
+    libs = d.get("librerias_ficohsa") or {}
+    if libs.get("presentes") or libs.get("faltantes"):
+        L.append("## Librerías Ficohsa\n")
+        if libs.get("presentes"):
+            L.append(f"**Presentes ({len(libs['presentes'])}):** " + ", ".join(f"`{x}`" for x in libs["presentes"]))
+        if libs.get("faltantes"):
+            L.append(f"\n**No usadas ({len(libs['faltantes'])}):** " + ", ".join(f"`{x}`" for x in libs["faltantes"]))
+        L.append("")
+
+    # ── Validación hexagonal (detalle) ──
+    details = hex_.get("details") or []
+    L.append("## Validación hexagonal\n")
+    L.append(f"{hex_.get('errors',0)} errores · {hex_.get('warnings',0)} warnings.\n")
+    if details:
+        L.append("| Severidad | Regla | Archivo | Mensaje |")
+        L.append("|---|---|---|---|")
+        for v in details[:50]:
+            msg = str(v.get("message", "")).replace("\n", " ").replace("|", "\\|")
+            L.append(f"| {v.get('type','')} | {v.get('rule','')} | {v.get('file','')} | {msg} |")
+        if len(details) > 50:
+            L.append(f"\n_(+{len(details)-50} violaciones adicionales)_")
+        L.append("")
+
+    # ── AWS ──
+    aws = d.get("aws") or {}
+    if aws.get("checks"):
+        L.append("## Validaciones AWS\n")
+        L.append(f"Ambiente: `{aws.get('env','') or '-'}` · Tabla DynamoDB: `{aws.get('dynamo_table','') or '-'}`\n")
+        L.append("| Check | Estado | Detalle |")
+        L.append("|---|:---:|---|")
+        for ck in aws["checks"]:
+            det = str(ck.get("detail", "")).replace("\n", " ").replace("|", "\\|")
+            L.append(f"| {ck.get('check','')} | {st_icon(ck.get('status',''),'')} | {det} |")
+        L.append("")
+
+    # ── Especificación Técnica (ET) ──
+    et = d.get("especificacion_tecnica") or {}
+    if et.get("checks"):
+        L.append("## Especificación Técnica (ET)\n")
+        if et_fuente:
+            L.append(f"Fuente: {et_fuente}\n")
+        L.append("| Check | Estado | Detalle |")
+        L.append("|---|:---:|---|")
+        for ck in et["checks"]:
+            det = str(ck.get("detail", "")).replace("\n", " ").replace("|", "\\|")
+            L.append(f"| {ck.get('check','')} | {st_icon(ck.get('status',''),'')} | {det} |")
+        L.append("")
+
+    # ── Variable Group (Azure Library) ──
+    vg = d.get("azure_variable_group") or {}
+    if vg:
+        L.append("## Variable Group (Azure DevOps Library)\n")
+        L.append(f"{len(vg)} variables (secretos mostrados como `***SECRET***`).\n")
+        L.append("| Variable | Valor |")
+        L.append("|---|---|")
+        for k in sorted(vg.keys()):
+            val = str(vg[k]).replace("\n", " ").replace("|", "\\|")
+            if len(val) > 120:
+                val = val[:117] + "…"
+            L.append(f"| `{k}` | {val} |")
+        L.append("")
+
+    L.append("---")
+    L.append(f"*Generado desde `{a.name}_compliance.json` · pipeline `compliance_pipeline_v5.py`.*")
+
+    fp = os.path.join(output_dir, f"{a.name}_compliance.md")
+    Path(fp).write_text("\n".join(L) + "\n", encoding="utf-8")
+    return fp
+
+
 # ── Excel individual (5 hojas: Resumen, Cumple, No Cumple, Librerías, ET) ───────
 
 def generate_individual_excel(a: MicroAnalysis, output_dir):
@@ -3911,6 +4129,8 @@ def _run_single(args):
         print(f"📝  JSON: {generate_individual_json_analysis(a, str(output_dir))}")
     if args.format in ("html", "all"):
         print(f"🌐  HTML: {generate_individual_html_analysis(a, str(output_dir))}")
+    if args.format in ("markdown", "all"):
+        print(f"📝  Markdown: {generate_individual_markdown(a, str(output_dir))}")
     if args.format in ("excel", "all"):
         xlsx = generate_individual_excel(a, str(output_dir))
         print(f"📊  Excel: {xlsx}" if xlsx else "📊  Excel omitido (instala openpyxl)")
@@ -4026,8 +4246,8 @@ Variables de entorno (pipeline):
     parser.add_argument("--single", metavar="PATH", help="Analiza un solo micro local (no requiere PAT)")
     parser.add_argument("--pipeline", action="store_true",
                         help="Ejecuta el flujo completo (clone masivo + HUs/VG + ET/EF + Excel)")
-    parser.add_argument("--format", choices=["console", "json", "html", "excel", "all"], default="console",
-                        help="Formato de reporte (single: console/json/html/excel/all; pipeline: json/html/excel)")
+    parser.add_argument("--format", choices=["console", "json", "html", "markdown", "excel", "all"], default="console",
+                        help="Formato de reporte (single: console/json/html/markdown/excel/all; pipeline: json/html/excel)")
     parser.add_argument("--output", default=".", help="Directorio de salida (modo --single)")
     parser.add_argument("--fail-on-critical", action="store_true",
                         help="Exit code 1 si algún criterio crítico NO CUMPLE (modo --single)")
