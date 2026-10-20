@@ -34,7 +34,8 @@ from pathlib import Path
 
 
 # ── Catálogo de estándares de enmascarado (Lineamiento-de-Enmascarado-de-Logs) ──
-# 11 parciales + 7 completos (incl. m_object) + default.
+# 11 parciales + 7 completos (incl. m_object) + default + alias en uso en las ET.
+# CATÁLOGO ÚNICO: también lo usa el check de Logs de compliance_pipeline_v5.py.
 MASK_STANDARDS = {
     # parciales
     "m_account", "m_balance", "m_blacklist", "m_city", "m_email", "m_gender",
@@ -43,6 +44,8 @@ MASK_STANDARDS = {
     "m_address", "m_amount", "m_card", "m_date", "m_pin", "m_token", "m_object",
     # default
     "default",
+    # alias / genéricos aceptados (en uso en ET publicadas)
+    "object", "m_mail", "m_generic", "m_text", "full",
 }
 
 # ── Tipología de API (Lineamiento caller-service) ──
@@ -141,14 +144,63 @@ def parse_et(content: str) -> dict:
         mn = re.search(r'"name"\s*:\s*"([^"]+)"', blk)
         if mn:
             em.dynamo_method = mn.group(1)
-        # maskfields declarados (campo/estandar) en el bloque
-        for mf in re.finditer(r'["`]([A-Za-z][\w.-]*)/([a-z_]+)["`]', blk):
-            em.masked_fields.append((mf.group(1), mf.group(2)))
+        # maskfields declarados: solo en CONTEXTO de enmascarado (sección "Enmascaramiento"
+        # o lista "maskfields"), no cualquier `a/b` del bloque (p. ej. `application/json`).
+        em.masked_fields = _extract_masked_fields(blk)
         # campos con Cifrado = SI en las tablas de request/response
         em.cifrado_fields = _extract_cifrado_si(blk)
         out["methods"].append(em)
 
     return out
+
+
+_MASK_HEADING_RE = re.compile(r'^#{2,6}\s.*enmascar', re.IGNORECASE)
+_HEADING_RE = re.compile(r'^#{1,6}\s')
+# "campo/estrategia" completo entre comillas o backticks (formato de las listas maskfields);
+# así no cuentan URLs (`_wiki/wikis`) ni prosa ("cuenta/tarjeta") dentro de la sección.
+_MASK_PAIR_RE = re.compile(r'(["`])([A-Za-z][\w.\[\]-]*)/([a-z][a-z_]*)\1')
+_MASK_FIELD_RE = re.compile(r'[A-Za-z][\w.\[\]-]*')
+_MASK_STRATEGY_RE = re.compile(r'[a-z][a-z_]*')
+
+
+def _extract_masked_fields(block: str):
+    """Extrae (campo, estrategia) del bloque de un método, solo en contexto de enmascarado:
+      - Tablas bajo un encabezado '#### x.y.z Enmascaramiento ...':
+        | campo | `estrategia` | ...   (admite columna inicial de numeración)
+      - Pares "campo/estrategia" dentro de esa sección o de un arreglo "maskfields": [...].
+    La estrategia se devuelve tal cual; su validez la decide MASK_STANDARDS."""
+    pairs = []
+
+    def _add(campo, est):
+        if (campo, est) not in pairs:
+            pairs.append((campo, est))
+
+    in_mask = False
+    for line in block.splitlines():
+        s = line.strip()
+        if _HEADING_RE.match(s):
+            in_mask = bool(_MASK_HEADING_RE.match(s))
+            continue
+        if not in_mask:
+            continue
+        if s.startswith("|"):
+            # "data.accountNumber (request)" → "data.accountNumber"
+            cells = [re.sub(r'\s*\([^)]*\)\s*$', "", c.strip().strip("`").strip()).strip("`")
+                     for c in s.strip("|").split("|")]
+            for i in range(1, len(cells)):
+                if (_MASK_STRATEGY_RE.fullmatch(cells[i])
+                        and _MASK_FIELD_RE.fullmatch(cells[i - 1])
+                        and not cells[i - 1].isdigit()):
+                    _add(cells[i - 1], cells[i])
+                    break
+        else:
+            for mf in _MASK_PAIR_RE.finditer(s):
+                _add(mf.group(2), mf.group(3))
+
+    for arr in re.finditer(r'"?maskfields"?\s*:\s*\[(.*?)\]', block, re.IGNORECASE | re.DOTALL):
+        for mf in re.finditer(r'"([A-Za-z][\w.\[\]-]*)/([a-z][a-z_]*)"', arr.group(1)):
+            _add(mf.group(1), mf.group(2))
+    return pairs
 
 
 def _extract_cifrado_si(block: str):
