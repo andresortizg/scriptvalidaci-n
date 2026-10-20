@@ -49,6 +49,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
+try:
+    # Catálogo ÚNICO de estrategias de enmascarado (compartido con la validación de la ET).
+    from et_checks import MASK_STANDARDS
+except Exception:
+    MASK_STANDARDS = {"default", "m_account", "m_id", "m_card"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN — VERSIONES Y CATÁLOGO (Wave 4 / ODD 14 / D6)
@@ -62,13 +68,13 @@ from datetime import datetime, timezone, timedelta
 # vacíos sin build (aurorapg, kafka, secret, sns, sqs). Otras libs fuera de convención
 # (cache_key_generator, calculate-hash-handler, authorization_filter, error-lib) tampoco.
 LIB_MIN_VERSIONS = {
-    "webflux-core":                       "1.0.1",
-    "webflux-router":                     "1.0.1",
-    "webflux-exception":                  "2.0.0",
-    "webflux-logging":                    "1.2.0",
-    "webflux-web-client":                 "1.2.0",
-    "webflux-resilience":                 "2.0.1",
-    "webflux-regionalization":            "1.0.0",
+    "webflux-core":                       "1.0.3",
+    "webflux-router":                     "1.0.2",
+    "webflux-exception":                  "2.0.2",
+    "webflux-logging":                    "1.2.2",
+    "webflux-web-client":                 "1.2.1",
+    "webflux-resilience":                 "2.0.2",
+    "webflux-regionalization":            "1.0.1",
     "webflux-homologator":                "1.0.1",
     "webflux-aws-lambda":                 "1.0.0",
     "webflux-aws-parameter":              "1.0.0",
@@ -273,7 +279,7 @@ _OBSERVATION_ENRICHMENT = {
     ),
     r"estrategia\(s\) de maskfield inválida": (
         "Se usan estrategias de enmascarado no soportadas.",
-        "Las estrategias válidas son: default, m_account, m_id, m_card (runbook webflux-logging).",
+        "Las estrategias válidas son las del catálogo de enmascarado (m_*, default, object, full; ver MASK_STANDARDS en et_checks.py).",
         "Acción: Corregir el formato 'campo/estrategia' en mask-fields / mask-fields-by-path."
     ),
     r"falta ficohsa\.logging\.masking\.table-name": (
@@ -1010,11 +1016,10 @@ def check_logging(repo_root) -> ComplianceResult:
         else:
             iss.append("ficohsa.logging.aop.enabled NO está en true (requerido por @LogExternalCall)")
 
-    # ── Estrategias de maskfield válidas (runbook webflux-logging, sección 7) ─────
-    # Formato de cada maskfield: "campo/estrategia". Estrategias válidas:
-    # default, m_account, m_id, m_card. Se validan los valores que aparezcan como
-    # default embebido en mask-fields / mask-fields-by-path del application.yml.
-    valid_mask_strategies = {"default", "m_account", "m_id", "m_card"}
+    # ── Estrategias de maskfield válidas (catálogo único MASK_STANDARDS de et_checks) ─
+    # Formato de cada maskfield: "campo/estrategia". Se validan los valores que aparezcan
+    # como default embebido en mask-fields / mask-fields-by-path del application.yml.
+    valid_mask_strategies = MASK_STANDARDS
     detected_strategies = set()
     # Solo se analiza el VALOR de las claves mask-fields / mask-fields-by-path (no las
     # claves-ruta como "[/credit-card-purchase/v1/execution]"). Un maskfield tiene la
@@ -2144,14 +2149,8 @@ def step2_build_json():
         repo = fields.get("Custom.Repo", "").strip()
         if not repo:
             continue
-        et, ef = extract_links(fields.get("System.Description", ""))
         mapping.setdefault(repo, {"repo": repo, "hus": []})
-        mapping[repo]["hus"].append({
-            "id": wi["id"], "title": fields.get("System.Title", ""),
-            "state": fields.get("System.State", ""), "tags": fields.get("System.Tags", ""),
-            "et_links": et, "ef_links": ef,
-            "azure_url": f"https://dev.azure.com/{ORG}/{PROJECT}/_workitems/edit/{wi['id']}",
-        })
+        mapping[repo]["hus"].append(_hu_from_workitem(wi))
 
     print("\n  2B. Variable Groups (-stg)...")
     local = sorted(os.path.basename(d) for d in glob.glob(os.path.join(BASE_DIR, "ms-*")) if os.path.isdir(d))
@@ -2258,6 +2257,35 @@ def fetch_wiki_page(wiki_url):
     return res.get("content", "") if res else None
 
 
+def _person_name(value):
+    """Campo identidad de Azure Boards (dict con displayName, o str) -> nombre."""
+    if isinstance(value, dict):
+        return (value.get("displayName") or value.get("uniqueName") or "").strip()
+    return (value or "").strip() if isinstance(value, str) else ""
+
+
+def _hu_from_workitem(wi):
+    """Construye el dict de HU usado por el pipeline a partir de un work item de Azure.
+    El desarrollador sale de Custom.Desarrollador y, si está vacío, de System.AssignedTo."""
+    fields = wi.get("fields", {})
+    et, ef = extract_links(fields.get("System.Description", ""))
+    return {"id": wi["id"], "title": fields.get("System.Title", ""),
+            "state": fields.get("System.State", ""), "tags": fields.get("System.Tags", ""),
+            "developer": (_person_name(fields.get("Custom.Desarrollador"))
+                          or _person_name(fields.get("System.AssignedTo"))),
+            "et_links": et, "ef_links": ef,
+            "azure_url": f"https://dev.azure.com/{ORG}/{PROJECT}/_workitems/edit/{wi['id']}"}
+
+
+def fetch_hus_by_ids(hu_ids):
+    """Descarga en vivo HUs concretas por ID (flag --hu)."""
+    if not AZURE_PAT or not hu_ids:
+        return []
+    ids_str = ",".join(str(x) for x in hu_ids)
+    res = api_call(f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/wit/workitems?ids={ids_str}&api-version=7.0")
+    return [_hu_from_workitem(wi) for wi in (res or {}).get("value", [])]
+
+
 def fetch_hus_for_micro(repo_name, download_docs=True):
     """Equivalente a los pasos 2A+3 del pipeline, pero para UN micro: busca sus User
     Stories en Azure Boards por Custom.Repo = <repo_name>, extrae links ET/EF y (si
@@ -2283,8 +2311,29 @@ def fetch_hus_for_micro(repo_name, download_docs=True):
             print(f"⚠️  No se pudo consultar HUs de '{repo_name}': {e}", file=sys.stderr)
             return []
 
+    terms = {repo_name, repo_name.replace("_", "-")}
+
+    def _discover(field):
+        seen = []
+        for term in terms:
+            safe_term = term.replace("'", "''")
+            for _id in _wiql_ids(f"[{field}] CONTAINS '{safe_term}'"):
+                if _id not in seen:
+                    seen.append(_id)
+        return seen
+
     # 1) Mecanismo principal: HUs con Custom.Repo = <repo_name>.
     ids = _wiql_ids(f"[Custom.Repo] = '{safe_repo}'")
+
+    # 1b) HUs cuyo TÍTULO contiene el nombre del micro se aceptan SIEMPRE, aunque
+    #     Custom.Repo esté vacío y aunque otras HUs sí lo tengan (p. ej. HU 123863
+    #     "Micro ms-ifs-corr-correspondence_email_mgmt-product" con Custom.Repo = None
+    #     y la única con ET descargable). Se verifican luego con límite de palabra
+    #     para no mezclar 'ms-x-wrapper' con 'ms-x-wrapper-v2'.
+    title_extra = []
+    if ids:
+        title_extra = [i for i in _discover("System.Title") if i not in ids]
+        ids = ids + title_extra
 
     # 2) Fallback: si ninguna HU tiene Custom.Repo poblado, descubrir por el TÍTULO y,
     #    si tampoco, por la DESCRIPCIÓN. Muchas HUs no llenan Custom.Repo pero mencionan
@@ -2292,17 +2341,6 @@ def fetch_hus_for_micro(repo_name, download_docs=True):
     #    descripción. Se busca por el nombre del repo y por su forma con guion medio
     #    (brokered_product_admin ↔ brokered-product-admin).
     if not ids:
-        terms = {repo_name, repo_name.replace("_", "-")}
-
-        def _discover(field):
-            seen = []
-            for term in terms:
-                safe_term = term.replace("'", "''")
-                for _id in _wiql_ids(f"[{field}] CONTAINS '{safe_term}'"):
-                    if _id not in seen:
-                        seen.append(_id)
-            return seen
-
         ids = _discover("System.Title")
         src = "título"
         if not ids:
@@ -2328,14 +2366,15 @@ def fetch_hus_for_micro(repo_name, download_docs=True):
         return []
     ids_str = ",".join(str(x) for x in ids[:200])
     res = api_call(f"https://dev.azure.com/{ORG}/{PROJECT}/_apis/wit/workitems?ids={ids_str}&api-version=7.0")
-    hus = []
-    for wi in (res or {}).get("value", []):
-        fields = wi.get("fields", {})
-        et, ef = extract_links(fields.get("System.Description", ""))
-        hus.append({"id": wi["id"], "title": fields.get("System.Title", ""),
-                    "state": fields.get("System.State", ""), "tags": fields.get("System.Tags", ""),
-                    "et_links": et, "ef_links": ef,
-                    "azure_url": f"https://dev.azure.com/{ORG}/{PROJECT}/_workitems/edit/{wi['id']}"})
+    hus = [_hu_from_workitem(wi) for wi in (res or {}).get("value", [])]
+    if title_extra:
+        name_re = re.compile(r"(?<![\w-])(?:" + "|".join(re.escape(t) for t in terms)
+                             + r")(?![\w-])", re.IGNORECASE)
+        hus = [h for h in hus if h["id"] not in title_extra or name_re.search(h["title"])]
+        added = [h["id"] for h in hus if h["id"] in title_extra]
+        if added:
+            print(f"ℹ️  + {len(added)} HU(s) sin Custom.Repo con el micro en el título: "
+                  + ", ".join(f"#{i}" for i in added))
     print(f"📋  HUs de '{repo_name}': {len(hus)} (ET links: {sum(len(h['et_links']) for h in hus)}, "
           f"EF links: {sum(len(h['ef_links']) for h in hus)})")
     if download_docs:
@@ -2945,6 +2984,7 @@ class MicroAnalysis:
     lines_of_code: int = 0
     hu_id: str = ""
     hu_title: str = ""
+    hu_dev: str = ""                                   # desarrollador de la HU (Custom.Desarrollador / AssignedTo)
     variable_group: dict = field(default_factory=dict)
     aws_results: list = field(default_factory=list)   # resultados AWS en vivo (DynamoDB/ParamStore/Secrets)
     aws_env: str = ""                                  # ambiente derivado (dev/stg/uat/prd)
@@ -3019,8 +3059,11 @@ def analyze_microservice(base_path, ms_data=None):
     a.methods = detect_methods(base_path)
 
     hu0 = find_hu_for_method(a.methods[0], a.hus) if a.hus else None
+    if hu0 is None and a.hus:
+        hu0 = a.hus[0]   # sin match por endpoint: se reporta la primera HU del micro
     a.hu_id = str(hu0["id"]) if hu0 else ""
     a.hu_title = hu0.get("title", "") if hu0 else ""
+    a.hu_dev = hu0.get("developer", "") if hu0 else ""
 
     # Criterios a nivel micro = ALL_CHECKS de v5 (SB4), con relabel SB3 igual que analyze_micro
     state = a.migration_state
@@ -3081,6 +3124,7 @@ def analyze_limited(repo_name, ms_data):
     hu0 = a.hus[0] if a.hus else None
     a.hu_id = str(hu0["id"]) if hu0 else ""
     a.hu_title = hu0.get("title", "") if hu0 else ""
+    a.hu_dev = hu0.get("developer", "") if hu0 else ""
     for crit in ("arquetipo", "librerias_ficohsa", "jackson3", "logging", "resilience",
                  "mappers", "envelope", "caller_service", "regionalizacion", "dtos",
                  "cobertura", "configmap"):
@@ -3376,7 +3420,7 @@ border-radius:8px 8px 0 0;cursor:pointer;font-size:14px;font-weight:600}} .tabs 
 .pill{{display:inline-block;background:#64748b;color:white;border-radius:10px;padding:0 7px;font-size:11px;margin-left:5px}}</style></head><body>
 <h1>🛡️ Compliance v5 — Ficohsa WebFlux (Spring Boot 4)</h1>
 <p>📦 <strong>{_repo_link}</strong> | Clasificación: {a.clasificacion} | Estado migración: <strong>{a.migration_state.upper()}</strong></p>
-<p class="ts">🌱 Rama: <code>{_html.escape(a.source_branch or '-')}</code>{(' @ <code>'+_html.escape(a.source_commit)+'</code>') if a.source_commit else ''} | Spring Boot: {a.spring_boot_version} | LOC: {a.lines_of_code} | HU: {a.hu_id or '-'} | Estado: <span class="status">{pct}%</span></p>
+<p class="ts">🌱 Rama: <code>{_html.escape(a.source_branch or '-')}</code>{(' @ <code>'+_html.escape(a.source_commit)+'</code>') if a.source_commit else ''} | Spring Boot: {a.spring_boot_version} | LOC: {a.lines_of_code} | HU: {a.hu_id or '-'} | Dev: {_html.escape(a.hu_dev or '-')} | Estado: <span class="status">{pct}%</span></p>
 <div class="cards">
 <div class="card"><div class="n" style="color:#16a34a">{sum(1 for r in a.results if r.compliant is True)}</div><div class="l">CUMPLE</div></div>
 <div class="card"><div class="n" style="color:#dc2626">{sum(1 for r in a.results if r.compliant is False)}</div><div class="l">NO CUMPLE</div></div>
@@ -3420,7 +3464,7 @@ def _analysis_to_dict(a: MicroAnalysis):
     return {
         "microservicio": a.name, "path": a.path, "clasificacion": a.clasificacion,
         "migration_state": a.migration_state, "spring_boot_version": a.spring_boot_version,
-        "lines_of_code": a.lines_of_code, "hu_id": a.hu_id, "hu_title": a.hu_title,
+        "lines_of_code": a.lines_of_code, "hu_id": a.hu_id, "hu_title": a.hu_title, "hu_dev": a.hu_dev,
         "source_branch": a.source_branch, "source_commit": a.source_commit,
         "repo_url": f"https://dev.azure.com/{ORG}/{PROJECT}/_git/{a.name}" + (
             f"?version=GB{urllib.parse.quote(a.source_branch)}"
@@ -3530,6 +3574,7 @@ def generate_individual_markdown(a: MicroAnalysis, output_dir):
     hu_title = d.get("hu_title") or ""
     hu_cell = (f"#{hu}" + (f" — {hu_title}" if hu_title else "")) if hu else (et_fuente or "-")
     L.append(f"| HU asociada | {hu_cell} |")
+    L.append(f"| Desarrollador (HU) | {d.get('hu_dev') or '-'} |")
     L.append(f"| Validación hexagonal | {hex_.get('errors',0)} errores / {hex_.get('warnings',0)} warnings |")
     L.append(f"| **Cumplimiento global** | **{d.get('porcentaje','')} %** |")
     resultado = "FALLÓ" if n_fail else "PASÓ"
@@ -3809,14 +3854,14 @@ def generate_consolidated_excel_rich(analyses, output_dir):
     # SHEET 1 — Matriz Cumplimiento
     ws1 = wb.active
     ws1.title = "Matriz Cumplimiento"
-    _hdr(ws1, ["#", "Microservicio", "Clasificación", "Método/HU", "HU ID", "Versión SB",
+    _hdr(ws1, ["#", "Microservicio", "Clasificación", "Método/HU", "HU ID", "Desarrollador", "Versión SB",
                "LOC", "Estado migración"] + crit_labels + ["% Cumplimiento"])
     row = 2
     for idx, a in enumerate(sorted(analyses, key=lambda x: x.name), 1):
         by_crit = {r.criterion: r for r in a.results}
         pct = _analysis_pct(a)
         for method in (a.methods or ["-"]):
-            base = [idx, a.name, a.clasificacion, method, a.hu_id or "-",
+            base = [idx, a.name, a.clasificacion, method, a.hu_id or "-", a.hu_dev or "-",
                     a.spring_boot_version, a.lines_of_code, a.migration_state.upper()]
             for c, v in enumerate(base, 1):
                 cell = ws1.cell(row, c, v); cell.border = border
@@ -3835,21 +3880,22 @@ def generate_consolidated_excel_rich(analyses, output_dir):
             pcell.border = border
             row += 1
     ws1.freeze_panes = "E2"
-    for i, w in enumerate([5, 40, 14, 30, 8, 12, 8, 14] + [15] * len(crit_labels) + [14], 1):
+    for i, w in enumerate([5, 40, 14, 30, 8, 28, 12, 8, 14] + [15] * len(crit_labels) + [14], 1):
         ws1.column_dimensions[get_column_letter(i)].width = w
 
     # SHEET 2 — Observaciones
     ws2 = wb.create_sheet("Observaciones")
-    _hdr(ws2, ["#", "Microservicio", "HU ID"] + crit_labels)
+    _hdr(ws2, ["#", "Microservicio", "HU ID", "Desarrollador"] + crit_labels)
     row = 2
     for idx, a in enumerate(sorted(analyses, key=lambda x: x.name), 1):
         by_crit = {r.criterion: r for r in a.results}
         ws2.cell(row, 1, idx); ws2.cell(row, 2, a.name); ws2.cell(row, 3, a.hu_id or "-")
+        ws2.cell(row, 4, a.hu_dev or "-")
         for j, crit in enumerate(_CONSOLIDATED_CRIT_ORDER):
             r = by_crit.get(crit)
-            ws2.cell(row, 4 + j, r.observation_summary if r else "")
+            ws2.cell(row, 5 + j, r.observation_summary if r else "")
         row += 1
-    for i, w in enumerate([5, 40, 8] + [40] * len(crit_labels), 1):
+    for i, w in enumerate([5, 40, 8, 28] + [40] * len(crit_labels), 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
 
     # SHEET 3 — Librerías por Micro
@@ -4065,6 +4111,15 @@ def _run_single(args):
         hus_live = fetch_hus_for_micro(repo_name, download_docs=True)
         if hus_live:
             ms_data["hus"] = hus_live   # reemplaza el caché por lo descargado en vivo
+    # --hu: fuerza la(s) HU(s) del reporte (p. ej. HUs sin Custom.Repo poblado).
+    if getattr(args, "hu", None):
+        forced = fetch_hus_by_ids(args.hu)
+        if forced:
+            print("📌  HU forzada por --hu: " + ", ".join(
+                f"#{h['id']} (dev: {h.get('developer') or '-'})" for h in forced))
+            ms_data["hus"] = forced
+        else:
+            print(f"⚠️  No se pudo descargar la HU indicada en --hu: {args.hu}", file=sys.stderr)
     ms_data["transversal_vars"] = transversal_vars   # para el check VG↔cm.yaml (no se muestra)
     ms_data["vg_env"] = infra_env                       # ambiente de infra del VG (staging/uat/prd o dev)
 
@@ -4144,7 +4199,7 @@ def _print_analysis_console(a: MicroAnalysis):
     print(f"\n{'═'*66}")
     print(f"  Compliance v5 SB4 : {a.name}  ({a.clasificacion})")
     print(f"  Estado migración  : {a.migration_state.upper()}  |  Spring Boot: {a.spring_boot_version}  |  LOC: {a.lines_of_code}")
-    print(f"  HU: {a.hu_id or '-'}  |  Hexagonal: {a.hex_errors} err / {a.hex_warnings} warn  |  Cumplimiento: {_analysis_pct(a)}%")
+    print(f"  HU: {a.hu_id or '-'}  |  Dev: {a.hu_dev or '-'}  |  Hexagonal: {a.hex_errors} err / {a.hex_warnings} warn  |  Cumplimiento: {_analysis_pct(a)}%")
     print(f"{'═'*66}\n  CRITERIOS A NIVEL MICROSERVICIO")
     for r in a.results:
         label = _CRIT_LABEL.get(r.criterion, r.criterion)
@@ -4263,6 +4318,8 @@ Variables de entorno (pipeline):
                         help="[single] nombre exacto de la tabla DynamoDB (por defecto ban-xrs-ic-ddb-support-get-params-{env})")
     parser.add_argument("--et", default=None, metavar="PATH",
                         help="[single] ruta local a la ET (.md). Si se omite, se usa --et-url o los et_links de las HUs")
+    parser.add_argument("--hu", default=None, type=int, nargs="+", metavar="ID",
+                        help="[single] ID(s) de HU a usar en el reporte (si se omite, se buscan por Custom.Repo)")
     parser.add_argument("--et-url", default=None, metavar="URL",
                         help="[single] URL de la página de Wiki de Azure con la ET")
     # Flags del pipeline
